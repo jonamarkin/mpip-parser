@@ -9,16 +9,31 @@ import json
 import argparse
 from datetime import datetime
 from typing import Dict, List, Optional, Union
-import firebase_admin
-from firebase_admin import credentials, firestore
-from pathlib import Path
+import uuid # Import uuid for generating unique document IDs
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+except ImportError:
+    print("Firebase Admin SDK not found. Please install it using: pip install firebase-admin")
+    # Exit gracefully if Firebase Admin SDK is not installed
+    import sys
+    sys.exit(1)
 
 class MPIPParser:
     def __init__(self):
         self.data = {}
         
-    def parse_file(self, filepath: str) -> Dict:
-        """Parse a single mpiP profiling file"""
+    def parse_file(self, filepath: str, provided_interface_type: Optional[str] = None) -> Dict:
+        """
+        Parse a single mpiP profiling file.
+        Args:
+            filepath (str): The path to the mpiP log file.
+            provided_interface_type (Optional[str]): The interface type (e.g., 'tcp', 'opx')
+                                                     provided by the user. Defaults to None.
+        Returns:
+            Dict: A dictionary containing the parsed data.
+        """
         with open(filepath, 'r') as f:
             content = f.read()
         
@@ -37,8 +52,8 @@ class MPIPParser:
         # Extract callsite statistics
         callsite_stats = self._extract_callsite_stats(content)
         
-        # Determine interface type from filename or path
-        interface_type = self._determine_interface_type(filepath)
+        # Determine interface type: prioritize provided_interface_type, then try to infer from env var in log
+        interface_type = provided_interface_type if provided_interface_type else self._infer_interface_from_log(content)
         
         # Compile all data
         parsed_data = {
@@ -78,6 +93,11 @@ class MPIPParser:
         stop_match = re.search(r'@ Stop time\s*:\s*(.+)', content)
         if stop_match:
             info['stop_time'] = stop_match.group(1).strip()
+
+        # MPIP env var (for interface inference if not provided by user)
+        env_var_match = re.search(r'@ MPIP env var\s*:\s*(.+)', content)
+        if env_var_match:
+            info['mpip_env_var'] = env_var_match.group(1).strip()
         
         # Extract task assignments (nodes)
         task_assignments = []
@@ -145,15 +165,25 @@ class MPIPParser:
                     parts = line.split()
                     if len(parts) >= 6:
                         try:
-                            stats['operations'].append({
-                                'call_type': parts[0],
-                                'site': int(parts[1]),
-                                'time_ms': float(parts[2]),
-                                'app_percentage': float(parts[3]),
-                                'mpi_percentage': float(parts[4]),
-                                'count': int(parts[5]),
-                                'cov': float(parts[6]) if len(parts) > 6 else 0.0
-                            })
+                            # Handle multi-word call_type like 'Allreduce' or 'MPI_Comm_rank'
+                            call_type_parts = []
+                            idx = 0
+                            while idx < len(parts) and not parts[idx].isdigit():
+                                call_type_parts.append(parts[idx])
+                                idx += 1
+                            call_type = ' '.join(call_type_parts)
+
+                            remaining_parts = parts[idx:]
+                            if len(remaining_parts) >= 6:
+                                stats['operations'].append({
+                                    'call_type': call_type,
+                                    'site': int(remaining_parts[0]),
+                                    'time_ms': float(remaining_parts[1]),
+                                    'app_percentage': float(remaining_parts[2]),
+                                    'mpi_percentage': float(remaining_parts[3]),
+                                    'count': int(remaining_parts[4]),
+                                    'cov': float(remaining_parts[5])
+                                })
                         except ValueError:
                             continue
         
@@ -173,14 +203,24 @@ class MPIPParser:
                     parts = line.split()
                     if len(parts) >= 5:
                         try:
-                            stats['operations'].append({
-                                'call_type': parts[0],
-                                'site': int(parts[1]),
-                                'count': int(parts[2]),
-                                'total_bytes': float(parts[3]),
-                                'avg_bytes': float(parts[4]),
-                                'sent_percentage': float(parts[5]) if len(parts) > 5 else 0.0
-                            })
+                            # Handle multi-word call_type
+                            call_type_parts = []
+                            idx = 0
+                            while idx < len(parts) and not parts[idx].isdigit():
+                                call_type_parts.append(parts[idx])
+                                idx += 1
+                            call_type = ' '.join(call_type_parts)
+
+                            remaining_parts = parts[idx:]
+                            if len(remaining_parts) >= 5:
+                                stats['operations'].append({
+                                    'call_type': call_type,
+                                    'site': int(remaining_parts[0]),
+                                    'count': int(remaining_parts[1]),
+                                    'total_bytes': float(remaining_parts[2]),
+                                    'avg_bytes': float(remaining_parts[3]),
+                                    'sent_percentage': float(remaining_parts[4])
+                                })
                         except ValueError:
                             continue
         
@@ -195,7 +235,6 @@ class MPIPParser:
         if callsite_section:
             lines = callsite_section.group(1).strip().split('\n')
             
-            current_operation = None
             for line in lines:
                 line = line.strip()
                 if not line:
@@ -204,31 +243,45 @@ class MPIPParser:
                 parts = line.split()
                 if len(parts) >= 8:
                     try:
-                        stats['callsites'].append({
-                            'name': parts[0],
-                            'site': int(parts[1]),
-                            'rank': int(parts[2]) if parts[2] != '*' else 'aggregate',
-                            'count': int(parts[3]),
-                            'max_time': float(parts[4]),
-                            'mean_time': float(parts[5]),
-                            'min_time': float(parts[6]),
-                            'app_percentage': float(parts[7]),
-                            'mpi_percentage': float(parts[8]) if len(parts) > 8 else 0.0
-                        })
+                        # Handle multi-word name
+                        name_parts = []
+                        idx = 0
+                        while idx < len(parts) and not parts[idx].isdigit():
+                            name_parts.append(parts[idx])
+                            idx += 1
+                        name = ' '.join(name_parts)
+
+                        remaining_parts = parts[idx:]
+                        if len(remaining_parts) >= 8:
+                            stats['callsites'].append({
+                                'name': name,
+                                'site': int(remaining_parts[0]),
+                                'rank': int(remaining_parts[1]) if remaining_parts[1] != '*' else 'aggregate',
+                                'count': int(remaining_parts[2]),
+                                'max_time': float(remaining_parts[3]),
+                                'mean_time': float(remaining_parts[4]),
+                                'min_time': float(remaining_parts[5]),
+                                'app_percentage': float(remaining_parts[6]),
+                                'mpi_percentage': float(remaining_parts[7])
+                            })
                     except ValueError:
                         continue
         
         return stats
     
-    def _determine_interface_type(self, filepath: str) -> str:
-        """Determine interface type from filename or path"""
-        filepath_lower = filepath.lower()
-        if 'tcp' in filepath_lower:
-            return 'tcp'
-        elif 'opx' in filepath_lower or 'omni' in filepath_lower:
-            return 'opx'
-        else:
-            return 'unknown'
+    def _infer_interface_from_log(self, content: str) -> str:
+        """
+        Infers interface type from the 'MPIP env var' in the log content.
+        Defaults to 'unknown' if not found or recognized.
+        """
+        env_var_match = re.search(r'@ MPIP env var\s*:\s*(.+)', content)
+        if env_var_match:
+            env_var_value = env_var_match.group(1).lower()
+            if 'mpip_tcp' in env_var_value:
+                return 'tcp'
+            elif 'mpip_opx' in env_var_value or 'omni' in env_var_value:
+                return 'opx'
+        return 'unknown'
     
     def _generate_summary(self, run_info: Dict, mpi_time_stats: Dict, aggregate_time_stats: Dict) -> Dict:
         """Generate summary statistics"""
@@ -275,12 +328,19 @@ class FirebaseUploader:
         interface_type = data['interface_type']
         num_nodes = data['run_info']['num_nodes']
         
-        # Create collection path: experiments/{interface_type}/{num_nodes}_nodes
-        collection_path = f"experiments/{interface_type}/{num_nodes}_nodes"
+        # Use a more robust collection path structure for user-specific data
+        # This aligns with the security rules and common Firebase patterns
+        # artifacts/{appId}/users/{userId}/mpiP_experiments
+        # For this script, we'll use a fixed appId and userId for simplicity,
+        # but in a real app, these would be dynamic.
+        app_id = "default-mpiP-app" # Can be customized
+        user_id = "script-uploader" # Can be customized or passed as arg
+
+        collection_path = f"artifacts/{app_id}/users/{user_id}/mpiP_experiments"
         
-        # Generate document ID with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        doc_id = f"experiment_{timestamp}_{data['filename']}"
+        # Generate a unique document ID using UUID to prevent collisions,
+        # and include interface and nodes for easy identification.
+        doc_id = f"{interface_type}-{num_nodes}_nodes-{uuid.uuid4().hex}"
         
         # Upload to Firebase
         doc_ref = self.db.collection(collection_path).document(doc_id)
@@ -306,6 +366,8 @@ def main():
     parser = argparse.ArgumentParser(description='Parse mpiP profiling results and upload to Firebase')
     parser.add_argument('input_path', help='Path to file or directory containing mpiP results')
     parser.add_argument('--credentials', required=True, help='Path to Firebase credentials JSON file')
+    parser.add_argument('--interface-type', type=str, default='unknown',
+                        help='Specify the interface type (e.g., "tcp", "opx"). Defaults to "unknown" or inferred from log.')
     parser.add_argument('--output-json', help='Also save parsed data to JSON file')
     parser.add_argument('--dry-run', action='store_true', help='Parse files but don\'t upload to Firebase')
     
@@ -340,7 +402,8 @@ def main():
     for file_path in files_to_process:
         try:
             print(f"Parsing: {file_path}")
-            data = mpip_parser.parse_file(file_path)
+            # Pass the provided interface type to the parser
+            data = mpip_parser.parse_file(file_path, provided_interface_type=args.interface_type)
             parsed_experiments.append(data)
             print(f"  - Interface: {data['interface_type']}, Nodes: {data['run_info']['num_nodes']}, MPI%: {data['summary'].get('total_mpi_percentage', 'N/A')}")
         except Exception as e:
