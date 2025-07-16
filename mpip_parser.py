@@ -10,6 +10,7 @@ import argparse
 from datetime import datetime
 from typing import Dict, List, Optional, Union
 import uuid # Import uuid for generating unique document IDs
+from pathlib import Path
 
 try:
     import firebase_admin
@@ -34,7 +35,8 @@ class MPIPParser:
         Returns:
             Dict: A dictionary containing the parsed data.
         """
-        with open(filepath, 'r') as f:
+        # FIX: Changed encoding to 'latin-1' to handle potential UnicodeDecodeError
+        with open(filepath, 'r', encoding='latin-1') as f: 
             content = f.read()
         
         # Extract basic run information
@@ -78,7 +80,15 @@ class MPIPParser:
         # Command
         command_match = re.search(r'@ Command\s*:\s*(.+)', content)
         if command_match:
-            info['command'] = command_match.group(1).strip()
+            command_str = command_match.group(1).strip()
+            info['command'] = command_str
+            
+            # NEW: Extract batch size from the command string
+            batch_size_match = re.search(r'--batch-size\s+(\d+)', command_str)
+            if batch_size_match:
+                info['batch_size'] = int(batch_size_match.group(1))
+            else:
+                info['batch_size'] = 'N/A' # Default if not found
         
         # Version
         version_match = re.search(r'@ Version\s*:\s*(.+)', content)
@@ -290,6 +300,7 @@ class MPIPParser:
         # Basic info
         summary['num_processes'] = run_info.get('num_processes', 0)
         summary['num_nodes'] = run_info.get('num_nodes', 0)
+        summary['batch_size'] = run_info.get('batch_size', 'N/A') # NEW: Add batch_size to summary
         
         # MPI overhead
         if 'aggregate' in mpi_time_stats:
@@ -326,21 +337,19 @@ class FirebaseUploader:
     def upload_experiment(self, data: Dict) -> str:
         """Upload experiment data to Firebase"""
         interface_type = data['interface_type']
-        num_nodes = data['run_info']['num_nodes']
-        
-        # Use a more robust collection path structure for user-specific data
-        # This aligns with the security rules and common Firebase patterns
-        # artifacts/{appId}/users/{userId}/mpiP_experiments
-        # For this script, we'll use a fixed appId and userId for simplicity,
-        # but in a real app, these would be dynamic.
-        app_id = "default-mpiP-app" # Can be customized
-        user_id = "script-uploader" # Can be customized or passed as arg
+        # num_nodes = data['run_info']['num_nodes'] # No longer directly in path
+        batch_size = data['run_info'].get('batch_size', 'N/A') 
 
-        collection_path = f"artifacts/{app_id}/users/{user_id}/mpiP_experiments"
+        # Use a more robust collection path structure for user-specific data
+        # artifacts/{appId}/users/{userId}/mpiP_experiments/{interface_type}/{batch_size}_batchsize/{documentId}
+        app_id = "thesis" # Can be customized
+        user_id = "jonamarkin" # Can be customized or passed as arg
+
+        # UPDATED: Collection path now only includes interface_type and batch_size
+        collection_path = f"artifacts/{app_id}/users/{user_id}/mpiP_experiments/{interface_type}/{batch_size}_batchsize"
         
-        # Generate a unique document ID using UUID to prevent collisions,
-        # and include interface and nodes for easy identification.
-        doc_id = f"{interface_type}-{num_nodes}_nodes-{uuid.uuid4().hex}"
+        # Generate a unique document ID using UUID
+        doc_id = f"{uuid.uuid4().hex}" 
         
         # Upload to Firebase
         doc_ref = self.db.collection(collection_path).document(doc_id)
@@ -385,7 +394,8 @@ def main():
     elif input_path.is_dir():
         # Find all text files in directory
         for file_path in input_path.rglob('*'):
-            if file_path.is_file() and file_path.suffix in ['.txt', '.out', '.log', ''] and file_path.stat().st_size > 0:
+            # FIX: Added '.mpiP' to the list of recognized suffixes
+            if file_path.is_file() and file_path.suffix in ['.txt', '.out', '.log', '', '.mpiP'] and file_path.stat().st_size > 0:
                 files_to_process.append(str(file_path))
     else:
         print(f"Error: {input_path} is not a valid file or directory")
@@ -405,7 +415,7 @@ def main():
             # Pass the provided interface type to the parser
             data = mpip_parser.parse_file(file_path, provided_interface_type=args.interface_type)
             parsed_experiments.append(data)
-            print(f"  - Interface: {data['interface_type']}, Nodes: {data['run_info']['num_nodes']}, MPI%: {data['summary'].get('total_mpi_percentage', 'N/A')}")
+            print(f"  - Interface: {data['interface_type']}, Nodes: {data['run_info']['num_nodes']}, Batch Size: {data['run_info'].get('batch_size', 'N/A')}, MPI%: {data['summary'].get('total_mpi_percentage', 'N/A')}")
         except Exception as e:
             print(f"Error parsing {file_path}: {e}")
     
@@ -430,17 +440,21 @@ def main():
     print("\n=== SUMMARY ===")
     interface_counts = {}
     node_counts = {}
+    batch_size_counts = {} # NEW: Track batch size counts
     
     for exp in parsed_experiments:
         interface = exp['interface_type']
         nodes = exp['run_info']['num_nodes']
-        
+        batch_size = exp['run_info'].get('batch_size', 'N/A') # NEW: Get batch size
+
         interface_counts[interface] = interface_counts.get(interface, 0) + 1
         node_counts[nodes] = node_counts.get(nodes, 0) + 1
+        batch_size_counts[batch_size] = batch_size_counts.get(batch_size, 0) + 1 # NEW: Increment batch size count
     
     print(f"Total experiments: {len(parsed_experiments)}")
     print(f"By interface: {interface_counts}")
     print(f"By node count: {node_counts}")
+    print(f"By batch size: {batch_size_counts}") # NEW: Print batch size summary
 
 if __name__ == "__main__":
     main()
